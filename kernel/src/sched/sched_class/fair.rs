@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{collections::BinaryHeap, sync::Arc};
+use alloc::{boxed::Box, sync::Arc};
 use core::{
-    cmp::{self, Reverse},
-    sync::atomic::{AtomicU64, Ordering},
+    cmp, mem,
+    sync::atomic::{AtomicI64, AtomicU64, Ordering},
+    u64,
 };
 
 use ostd::{
@@ -14,30 +15,30 @@ use ostd::{
     },
 };
 
-use super::{
-    time::{base_slice_clocks, min_period_clocks},
-    CurrentRuntime, SchedAttr, SchedClassRq,
-};
 use crate::{
-    sched::nice::{Nice, NiceValue},
+    sched::{
+        nice::{Nice, NiceValue},
+        sched_class::{
+            time::{base_slice_clocks, tick_period_clocks},
+            CurrentRuntime, SchedAttr, SchedClassRq,
+        },
+    },
     thread::AsThread,
 };
 
-const WEIGHT_0: u64 = 1024;
+const WEIGHT_0: i64 = 1024;
 
-const HAS_PENDING: u64 = 1 << (u64::BITS - 1);
-
-pub const fn nice_to_weight(nice: Nice) -> u64 {
+pub const fn nice_to_weight(nice: Nice) -> i64 {
     // Calculated by the formula below:
     //
     //     weight = 1024 * 1.25^(-nice)
     //
     // We propose that every increment of the nice value results
     // in 12.5% change of the CPU load weight.
-    const FACTOR_NUMERATOR: u64 = 5;
-    const FACTOR_DENOMINATOR: u64 = 4;
+    const FACTOR_NUMERATOR: i64 = 5;
+    const FACTOR_DENOMINATOR: i64 = 4;
 
-    const NICE_TO_WEIGHT: [u64; 40] = const {
+    const NICE_TO_WEIGHT: [i64; 40] = const {
         let mut ret = [0; 40];
 
         let mut index = 0;
@@ -56,7 +57,6 @@ pub const fn nice_to_weight(nice: Nice) -> u64 {
                     WEIGHT_0 * numerator / denominator
                 }
             };
-            assert!(ret[index] & HAS_PENDING == 0);
 
             index += 1;
             nice += 1;
@@ -67,262 +67,274 @@ pub const fn nice_to_weight(nice: Nice) -> u64 {
     NICE_TO_WEIGHT[(nice.value().get() + 20) as usize]
 }
 
-/// The scheduling entity for the FAIR scheduling class.
-///
-/// The structure contains a significant indicator: `vruntime`.
-///
-/// # `vruntime`
-///
-/// The vruntime (virtual runtime) is calculated by the formula:
-///
-///     vruntime += runtime_delta * WEIGHT_0 / weight
-///
-/// and a thread with a lower vruntime gains a greater privilege to be
-/// scheduled, making the whole run queue balanced on vruntime (thus FAIR).
-///
-/// # Scheduling periods
-///
-/// Scheduling periods is designed to calculate the time slice for each threads.
-///
-/// The time slice for each threads is calculated by the formula:
-///
-///     time_slice = period * weight / total_weight
-///
-/// where `total_weight` is the sum of all weights in the run queue including
-/// the current thread and [`period`](FairClassRq::period) is calculated
-/// regarding the number of running threads.
-///
-/// When a thread meets the condition below, it will be preempted to the
-/// run queue. See [`FairClassRq::update_current`] for more details.
-///
-///     period_delta > time_slice
-///         || vruntime > rq_min_vruntime + normalized_time_slice
-///
-/// # The weight update process
-///
-/// The weight of a thread can be updated by the `sched_setattr` syscall series in
-/// any thread. This makes it difficult to re-evaluate the data of its run queue
-/// instantly after the update without a direct backward reference (which is
-/// impossible to be represented in safe Rust).
-///
-/// To handle this problem, we use a `pending_weight` field to store the new weight.
-/// When the thread is scheduled within the run queue, we will check if the weight
-/// needs to be updated since both the old and new weights are needed for re-evaluation.
-///
-/// To indicate whether the weight needs to be updated, we pack the `weight` field
-/// with a bit flag `HAS_PENDING`. The overall mechanism is similar to an optimized
-/// version of spin locks. When accessing the `weight` field:
-///
-/// - If the weight does not need to be updated (i.e. `weight & IS_PENDING == 0`),
-///   we simply return the weight.
-/// - If the weight needs to be updated (i.e. `weight & IS_PENDING != 0`), we try to
-///   store the new weight into the `weight` field with `IS_PENDING` cleared via a
-///   `compare_exchange_weak` loop, which shouldn't take too much time since the update
-///   frequency is usually relatively low.
-/// - If the result of the loop turns out that the weight doesn't need to be updated, we
-///   return the weight directly.
-/// - After a successful update, we re-evaluate the data of the run queue.
-///
-/// This method allows the access to the weight lock-free and ensures only 1 load
-/// is needed most of the time.
+fn wall_to_virtual(delta: i64, weight: i64) -> i64 {
+    if weight != WEIGHT_0 {
+        delta * WEIGHT_0 / weight
+        // TODO: set as cold path.
+    } else {
+        delta // Avoid unnecessary math most of the times.
+    }
+}
+
+fn avg_vruntime(mut weighted_vruntime_offsets: i64, total_weight: i64, min_vruntime: i64) -> i64 {
+    if weighted_vruntime_offsets < 0 {
+        // Sign flips effective floor/ceiling.
+        weighted_vruntime_offsets -= total_weight - 1;
+    }
+    weighted_vruntime_offsets / total_weight + min_vruntime
+}
+
+fn is_eligible(
+    vruntime: i64,
+    min_vruntime: i64,
+    total_weight: i64,
+    weighted_vruntime_offsets: i64,
+) -> bool {
+    (vruntime - min_vruntime) * total_weight <= weighted_vruntime_offsets
+}
+
 #[derive(Debug)]
 pub struct FairAttr {
-    weight: AtomicU64,
-    pending_weight: AtomicU64,
-    vruntime: AtomicU64,
+    weight: AtomicI64,
+    vlag: AtomicI64,
+    id: AtomicU64,
 }
 
 impl FairAttr {
     pub fn new(nice: Nice) -> Self {
         FairAttr {
             weight: nice_to_weight(nice).into(),
-            pending_weight: Default::default(),
-            vruntime: Default::default(),
+            vlag: AtomicI64::new(0),
+            id: AtomicU64::new(u64::MAX),
         }
     }
 
     pub fn update(&self, nice: Nice) {
-        self.pending_weight
-            .store(nice_to_weight(nice), Ordering::Relaxed);
-        self.weight.fetch_or(HAS_PENDING, Ordering::Release);
-    }
-
-    fn update_vruntime(&self, delta: u64, weight: u64) -> u64 {
-        let delta = delta * WEIGHT_0 / weight;
-        self.vruntime.fetch_add(delta, Ordering::Relaxed) + delta
-    }
-
-    fn fetch_weight(&self) -> (u64, u64) {
-        let mut weight = self.weight.load(Ordering::Acquire);
-        if weight & HAS_PENDING == 0 {
-            return (weight, weight);
-        }
-
-        let mut new_weight = self.pending_weight.load(Ordering::Relaxed);
-        loop {
-            match self.weight.compare_exchange_weak(
-                weight,
-                new_weight,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(failure) => {
-                    if failure & HAS_PENDING == 0 {
-                        return (failure, failure);
-                    }
-                    weight = failure;
-                    new_weight = self.pending_weight.load(Ordering::Relaxed);
-                }
-            }
-        }
-        let old_weight = weight & !HAS_PENDING;
-
-        // The `vruntime` field is an accumulated value, and we don't update
-        // it here.
-
-        (old_weight, new_weight)
+        self.weight.store(nice_to_weight(nice), Ordering::Release);
     }
 }
 
-/// The wrapper for threads in the FAIR run queue.
-///
-/// This structure is used to provide the capability for keying in the
-/// run queue implemented by `BTreeSet` in the `FairClassRq`.
-struct FairQueueItem(Arc<Task>, u64);
-
-impl core::fmt::Debug for FairQueueItem {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:?}", self.key())
-    }
-}
-
-impl FairQueueItem {
-    fn key(&self) -> u64 {
-        self.1
-    }
-}
-
-impl PartialEq for FairQueueItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.key().eq(&other.key())
-    }
-}
-
-impl Eq for FairQueueItem {}
-
-impl PartialOrd for FairQueueItem {
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FairQueueItem {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.key().cmp(&other.key())
-    }
-}
-
-/// The per-cpu run queue for the FAIR scheduling class.
-///
-/// See [`FairAttr`] for the explanation of vruntimes and scheduling periods.
-///
-/// The structure contains a `BTreeSet` to store the threads in the run queue to
-/// ensure the efficiency for finding next-to-run threads.
 #[derive(Debug)]
 pub(super) struct FairClassRq {
     #[expect(unused)]
     cpu: CpuId,
-    /// The ready-to-run threads.
-    entities: BinaryHeap<Reverse<FairQueueItem>>,
-    /// The minimum of vruntime in the run queue. Serves as the initial
-    /// value of newly-enqueued threads.
-    min_vruntime: u64,
-    total_weight: u64,
+    queue: EligibilityTree,
+    queue_len: usize,
+    queued_weight: i64,
+    weighted_vruntime_offsets: i64,
+    current_task_data: Option<TaskData>,
+    next_id: u64,
+    base_slice_clocks: i64,
+    lag_limit_clocks: i64,
+}
+
+#[derive(Debug)]
+struct TaskData {
+    task: Arc<Task>,
+    id: u64,
+    deadline: i64,
+    weight: i64,
+    vruntime: i64,
+    is_exiting: bool,
 }
 
 impl FairClassRq {
     pub fn new(cpu: CpuId) -> Self {
+        let base_slice_clocks = base_slice_clocks() as i64;
+        let lag_limit_clocks = (tick_period_clocks() as i64).max(2 * base_slice_clocks);
         Self {
             cpu,
-            entities: BinaryHeap::new(),
-            min_vruntime: 0,
-            total_weight: 0,
+            queue: EligibilityTree::new(),
+            queue_len: 0,
+            queued_weight: 0,
+            weighted_vruntime_offsets: 0,
+            current_task_data: None,
+            next_id: 0,
+            base_slice_clocks,
+            lag_limit_clocks,
         }
     }
 
-    /// The scheduling period is calculated as the maximum of the following two values:
-    ///
-    /// 1. The minimum period value, defined by [`min_period_clocks`].
-    /// 2. `period = min_granularity * n` where
-    ///    `min_granularity = log2(1 + num_cpus) * base_slice_clocks`, and `n` is the number of
-    ///    runnable threads (including the current running thread).
-    ///
-    /// The formula is chosen by 3 principles:
-    ///
-    /// 1. The scheduling period should reflect the running threads and CPUs;
-    /// 2. The scheduling period should not be too low to limit the overhead of context switching;
-    /// 3. The scheduling period should not be too high to ensure the scheduling latency
-    ///    & responsiveness.
-    fn period(&self) -> u64 {
-        let base_slice_clks = base_slice_clocks();
-        let min_period_clks = min_period_clocks();
-
-        // `+ 1` means including the current running thread.
-        let period_single_cpu =
-            (base_slice_clks * (self.entities.len() + 1) as u64).max(min_period_clks);
-        period_single_cpu * u64::from((1 + num_cpus()).ilog2())
+    fn min_vruntime(&self) -> i64 {
+        match (&self.current_task_data, self.queue.min_vruntime()) {
+            (None, None) => 0,
+            (None, Some(x)) => x,
+            (Some(current_task_data), None) => current_task_data.vruntime,
+            (Some(current_task_data), Some(y)) => current_task_data.vruntime.min(y),
+        }
     }
 
-    /// The virtual time slice for each thread in the run queue, measured in vruntime clocks.
-    fn vtime_slice(&self) -> u64 {
-        self.period() / (self.entities.len() + 1) as u64
+    fn total_weight(&self) -> i64 {
+        match &self.current_task_data {
+            Some(current_task_data) => current_task_data.weight + self.queued_weight,
+            None => self.queued_weight,
+        }
     }
 
-    /// The time slice for each thread in the run queue, measured in sched clocks.
-    fn time_slice(&self, cur_weight: u64) -> u64 {
-        self.period() * cur_weight / (self.total_weight + cur_weight)
+    fn slice(&self) -> i64 {
+        self.base_slice_clocks * (num_cpus().ilog2() as i64 + 1)
     }
 }
 
 impl SchedClassRq for FairClassRq {
-    fn enqueue(&mut self, entity: Arc<Task>, flags: Option<EnqueueFlags>) {
-        let fair_attr = &entity.as_thread().unwrap().sched_attr().fair;
-        let vruntime = match flags {
-            Some(EnqueueFlags::Spawn) => self.min_vruntime + self.vtime_slice(),
-            _ => self.min_vruntime,
+    fn enqueue(&mut self, task: Arc<Task>, flags: Option<EnqueueFlags>) {
+        // Φ' = ∑{i ∈ S∪⦃t⦄}[wᵢ(ρᵢ - ρₘᵢₙ')]
+        //    = ∑{i ∈ S}[wᵢ(ρᵢ - ρₘᵢₙ')] + wₜ(ρₜ - ρₘᵢₙ')
+        //    = ∑{i ∈ S}[wᵢ(ρᵢ - ρₘᵢₙ)] - ∑{i ∈ S}[wᵢ(ρₘᵢₙ' - ρₘᵢₙ)] + wₜ(ρₜ - ρₘᵢₙ')
+        //    = Φ + W(ρₘᵢₙ - ρₘᵢₙ') + wₜ(ρₜ - ρₘᵢₙ')
+
+        let fair_attr = &task.as_thread().unwrap().sched_attr().fair;
+
+        let weight = fair_attr.weight.load(Ordering::Relaxed);
+        let mut vslice = wall_to_virtual(self.slice(), weight);
+
+        let (id, vlag) = match flags {
+            Some(EnqueueFlags::Spawn) => {
+                // Define the ID for newly spawned tasks.
+                let id = self.next_id;
+                self.next_id += 1;
+                fair_attr.id.store(id, Ordering::Relaxed);
+
+                // Spawned tasks don't have lag.
+                let vlag = 0;
+
+                // When joining the competition; the existing tasks will be,
+                // on average, halfway through their slice, as such start tasks
+                // off with half a slice to ease into the competition.
+                // Reference: https://elixir.bootlin.com/linux/v6.16.8/source/kernel/sched/fair.c#L5300
+                vslice /= 2;
+
+                (id, vlag)
+            }
+            _ => {
+                // Load the already defined ID.
+                let id = fair_attr.id.load(Ordering::Relaxed);
+                debug_assert_ne!(id, u64::MAX);
+
+                // Load the stored virtual lag.
+                let vlag = fair_attr.vlag.load(Ordering::Relaxed);
+
+                (id, vlag)
+            }
         };
-        let (_old_weight, weight) = fair_attr.fetch_weight();
 
-        let vruntime = fair_attr
-            .vruntime
-            .fetch_max(vruntime, Ordering::Relaxed)
-            .max(vruntime);
+        let min_vruntime = self.min_vruntime();
+        let total_weight = self.total_weight();
+        let vruntime = if total_weight != 0 {
+            let avg_vruntime =
+                avg_vruntime(self.weighted_vruntime_offsets, total_weight, min_vruntime);
+            if vlag != 0 {
+                // If we want to place a task and preserve lag, we have to
+                // consider the effect of the new entity on the weighted
+                // average and compensate for this, otherwise lag can quickly
+                // evaporate.
+                // Reference: https://elixir.bootlin.com/linux/v6.16.8/source/kernel/sched/fair.c#L5230
+                let vlag_adjusted = (total_weight + weight) * vlag / total_weight;
+                avg_vruntime - vlag_adjusted
+            } else {
+                avg_vruntime
+            }
+        } else {
+            self.weighted_vruntime_offsets + min_vruntime
+        };
 
-        self.total_weight += weight;
-        self.entities.push(Reverse(FairQueueItem(entity, vruntime)));
-    }
+        if vruntime < min_vruntime {
+            // ρₜ = ρₘᵢₙ' => Φ' = Φ + W(ρₘᵢₙ - ρₘᵢₙ')
+            self.weighted_vruntime_offsets += total_weight * (min_vruntime - vruntime);
+        } else {
+            // ρₘᵢₙ' = ρₘᵢₙ => Φ' = Φ + wₜ(ρₜ - ρₘᵢₙ')
+            self.weighted_vruntime_offsets += weight * (vruntime - min_vruntime);
+        }
 
-    fn len(&self) -> usize {
-        self.entities.len()
-    }
+        let deadline = vruntime + vslice;
+        self.queue.insert(TaskData {
+            task,
+            deadline,
+            id,
+            weight,
+            vruntime,
+            is_exiting: false,
+        });
 
-    fn is_empty(&self) -> bool {
-        self.entities.is_empty()
+        self.queue_len += 1;
+        self.queued_weight += weight;
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
-        let Reverse(FairQueueItem(entity, _)) = self.entities.pop()?;
+        // Φ' = ∑{i ∈ S\⦃t⦄}[wᵢ(ρᵢ - ρₘᵢₙ')]
+        //    = ∑{i ∈ S\⦃t⦄}[wᵢ(ρᵢ - ρₘᵢₙ)] - ∑{i ∈ S\⦃t⦄}[wᵢ(ρₘᵢₙ' - ρₘᵢₙ)]
+        //    = Φ - wₜ(ρₜ - ρₘᵢₙ) - W'(ρₘᵢₙ' - ρₘᵢₙ)
 
-        let sched_attr = entity.as_thread().unwrap().sched_attr();
-        let (old_weight, _weight) = sched_attr.fair.fetch_weight();
-        // Equals to:
-        //
-        // self.total_weight = self.total_weight + weight - old_weight;
-        // self.total_weight -= weight;
-        self.total_weight -= old_weight;
+        let min_vruntime = self.min_vruntime();
+        let total_weight = self.total_weight();
+        let TaskData {
+            task,
+            id,
+            deadline,
+            weight,
+            vruntime,
+            is_exiting,
+        } = self
+            .queue
+            .pop_next(min_vruntime, total_weight, self.weighted_vruntime_offsets)?;
 
-        Some(entity)
+        if let Some(current_task_data) = &self.current_task_data {
+            let TaskData {
+                task: preempted_task,
+                vruntime: preempted_vruntime,
+                weight: preempted_weight,
+                is_exiting: preempted_is_exiting,
+                ..
+            } = current_task_data;
+
+            if !preempted_is_exiting {
+                // Store the virtual lag for the preempted task.
+                let avg_vruntime = if total_weight != 0 {
+                    avg_vruntime(self.weighted_vruntime_offsets, total_weight, min_vruntime)
+                } else {
+                    self.weighted_vruntime_offsets + min_vruntime
+                };
+                // Limit this to either double the slice length with a minimum of TICK_NSEC
+                // since that is the timing granularity.
+                // Reference: https://elixir.bootlin.com/linux/v6.16.8/source/kernel/sched/fair.c#L686
+                let vlimit = wall_to_virtual(self.lag_limit_clocks, weight);
+                let vlag = (avg_vruntime - preempted_vruntime).clamp(-vlimit, vlimit);
+                let preempted_fair_attr = &preempted_task.as_thread().unwrap().sched_attr().fair;
+                preempted_fair_attr.vlag.store(vlag, Ordering::Relaxed);
+            }
+
+            // This is the minimum queued vruntime *before* popping.
+            let min_queued_vruntime = self.queue.min_vruntime_against(vruntime);
+
+            if *preempted_vruntime < min_queued_vruntime {
+                // `preempted_vruntime` was the minimum vruntime and now it's moved
+                // forward to `min_queued_vruntime`.
+                // ρₜ = ρₘᵢₙ => Φ' = Φ - W'(ρₘᵢₙ' - ρₘᵢₙ)
+                self.weighted_vruntime_offsets -=
+                    self.queued_weight * (min_queued_vruntime - preempted_vruntime);
+            } else {
+                // `min_queued_vruntime` remains as the minimum vruntime.
+                // ρₘᵢₙ' = ρₘᵢₙ =>  Φ' = Φ - wₜ(ρₜ - ρₘᵢₙ)
+                self.weighted_vruntime_offsets -=
+                    preempted_weight * (preempted_vruntime - min_queued_vruntime);
+            }
+        } else {
+            // This is not a dequeue. `weighted_vruntime_offsets` doesn't change.
+        }
+
+        self.current_task_data = Some(TaskData {
+            task: task.clone(),
+            id,
+            vruntime,
+            weight,
+            deadline,
+            is_exiting,
+        });
+
+        self.queue_len -= 1;
+        self.queued_weight -= weight;
+
+        Some(task)
     }
 
     fn update_current(
@@ -331,24 +343,458 @@ impl SchedClassRq for FairClassRq {
         attr: &SchedAttr,
         flags: UpdateFlags,
     ) -> bool {
+        // Φ' = ∑{i ∈ S}[wᵢ(ρᵢ' - ρₘᵢₙ')]
+        //    = ∑{i ∈ S\⦃t⦄}[wᵢ(ρᵢ - ρₘᵢₙ')] + wₜ(ρₜ + Δ - ρₘᵢₙ')
+        //    = ∑{i ∈ S\⦃t⦄}[wᵢ(ρᵢ - ρₘᵢₙ + ρₘᵢₙ - ρₘᵢₙ')] + wₜ(ρₜ - ρₘᵢₙ') + wₜΔ
+        //    = ∑{i ∈ S\⦃t⦄}[wᵢ(ρᵢ - ρₘᵢₙ)] + (ρₘᵢₙ - ρₘᵢₙ')∑{i ∈ S\⦃t⦄}[wᵢ] + wₜ(ρₜ - ρₘᵢₙ') + wₜΔ
+        //    = Φ - wₜ(ρₜ - ρₘᵢₙ) + (ρₘᵢₙ - ρₘᵢₙ')(W - wₜ) + wₜ(ρₜ - ρₘᵢₙ') + wₜΔ
+        //    = Φ + wₜΔ - W(ρₘᵢₙ' - ρₘᵢₙ)
+
+        // The data for the current task must have been set in `pick_next`.
+        let current_task_data = self.current_task_data.as_mut().unwrap();
+        debug_assert_eq!(current_task_data.id, attr.fair.id.load(Ordering::Relaxed));
+
+        let weight = current_task_data.weight;
+        let vdelta = wall_to_virtual(rt.delta as i64, weight);
+        let deadline = current_task_data.deadline;
+
+        let old_vruntime = current_task_data.vruntime;
+        let new_vruntime = old_vruntime + vdelta;
+        current_task_data.vruntime = new_vruntime;
+
+        // Adjust `weighted_vruntime_offsets`.
+        let total_weight = weight + self.queued_weight;
+        if let Some(min_queued_vruntime) = self.queue.min_vruntime() {
+            // Advance `weighted_vruntime_offsets` with the contribution of the current task.
+            self.weighted_vruntime_offsets += weight * vdelta;
+
+            if old_vruntime < min_queued_vruntime {
+                // The old task's vruntime was the minimum vruntime and now the
+                // minimum vruntime is the minimum between the minimum queued
+                // vruntime and the new task's vruntime.
+                let new_min_vruntime = min_queued_vruntime.min(new_vruntime);
+                self.weighted_vruntime_offsets -= total_weight * (new_min_vruntime - old_vruntime);
+            }
+        } else {
+            // The queue is empty so the current task is the only one at play.
+            // `weighted_vruntime_offsets` is zero and doesn't change because the
+            // vruntime offset for the (only) task doesn't change, since it's also
+            // the task with the minimum vruntime.
+            debug_assert_eq!(self.weighted_vruntime_offsets, 0);
+        }
+
+        if self.queue.is_empty() {
+            return false; // There's no competing task.
+        }
+
         match flags {
-            UpdateFlags::Tick | UpdateFlags::Yield | UpdateFlags::Wait => {
-                let (_old_weight, weight) = attr.fair.fetch_weight();
-                let vruntime = attr.fair.update_vruntime(rt.delta, weight);
-                let leftmost = self.entities.peek();
-                self.min_vruntime = match leftmost {
-                    Some(Reverse(leftmost)) => vruntime.min(leftmost.key()),
-                    None => vruntime,
-                };
-                if leftmost.is_none() {
-                    return false;
+            UpdateFlags::Tick | UpdateFlags::Yield => new_vruntime >= deadline,
+            UpdateFlags::Wait => true,
+            UpdateFlags::Exit => {
+                // Avoid computing and storing vlag in `pick_next`.
+                current_task_data.is_exiting = true;
+                true
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.queue_len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+/// The [`EligibilityTree`] is a balanced binary search tree in which tasks are
+/// ordered by their deadlines.
+///
+/// This data structure currently behaves as an AVL tree but an RB tree is likely
+/// better.
+enum EligibilityTree {
+    Node {
+        data: TaskData,
+        min_vruntime: i64,
+        height: i8,
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+    Leaf,
+}
+
+impl core::fmt::Debug for EligibilityTree {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Leaf => write!(f, "Tree::Leaf"),
+            Self::Node { data, .. } => write!(f, "Tree::Node[id={}]", data.id),
+        }
+    }
+}
+
+impl Ord for TaskData {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        match self.deadline.cmp(&other.deadline) {
+            cmp::Ordering::Equal => self.id.cmp(&other.id),
+            ord => ord,
+        }
+    }
+}
+impl PartialOrd for TaskData {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for TaskData {
+    fn eq(&self, other: &Self) -> bool {
+        self.id.eq(&other.id)
+    }
+}
+impl Eq for TaskData {}
+
+impl EligibilityTree {
+    fn new() -> Self {
+        Self::Leaf
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_leaf()
+    }
+
+    fn insert(&mut self, new_data: TaskData) {
+        match self {
+            Self::Leaf => {
+                let min_vruntime = new_data.vruntime;
+                *self = Self::Node {
+                    data: new_data,
+                    min_vruntime,
+                    height: 0,
+                    left: Box::new(Self::new()),
+                    right: Box::new(Self::new()),
+                }
+            }
+            Self::Node {
+                data, left, right, ..
+            } => {
+                match new_data.cmp(data) {
+                    cmp::Ordering::Equal => {
+                        // *data = new_data;
+                        unreachable!()
+                    }
+                    cmp::Ordering::Less => left.insert(new_data),
+                    cmp::Ordering::Greater => right.insert(new_data),
+                }
+                self.update_and_rebalance();
+            }
+        }
+    }
+
+    fn min_vruntime(&self) -> Option<i64> {
+        match self {
+            Self::Leaf => None,
+            Self::Node { min_vruntime, .. } => Some(*min_vruntime),
+        }
+    }
+
+    fn pop_next(
+        &mut self,
+        global_min_vruntime: i64,
+        total_weight: i64,
+        weighted_vruntime_offsets: i64,
+    ) -> Option<TaskData> {
+        match self {
+            Self::Leaf => None,
+            Self::Node {
+                data, left, right, ..
+            } => {
+                if left.has_eligible_task(
+                    global_min_vruntime,
+                    total_weight,
+                    weighted_vruntime_offsets,
+                ) {
+                    let res =
+                        left.pop_next(global_min_vruntime, total_weight, weighted_vruntime_offsets);
+                    if res.is_some() {
+                        self.update_and_rebalance();
+                    }
+                    return res;
                 }
 
-                matches!(flags, UpdateFlags::Wait)
-                    || rt.period_delta > self.time_slice(weight)
-                    || vruntime > self.min_vruntime + self.vtime_slice()
+                if is_eligible(
+                    data.vruntime,
+                    global_min_vruntime,
+                    total_weight,
+                    weighted_vruntime_offsets,
+                ) {
+                    // Take ownership of this node so we can move its children around.
+                    let node = mem::replace(self, Self::Leaf);
+                    let Self::Node {
+                        data: task_data,
+                        left,
+                        mut right,
+                        ..
+                    } = node
+                    else {
+                        unreachable!();
+                    };
+
+                    // Case: no left child -> replace this node with right subtree.
+                    if left.is_leaf() {
+                        *self = *right;
+                        if !self.is_leaf() {
+                            self.update_and_rebalance();
+                        }
+                        return Some(task_data);
+                    }
+
+                    // Case: no right child -> replace this node with left subtree.
+                    if right.is_leaf() {
+                        *self = *left;
+                        if !self.is_leaf() {
+                            self.update_and_rebalance();
+                        }
+                        return Some(task_data);
+                    }
+
+                    // Case: two children -> replace with in-order successor (min of right).
+                    let successor = right.pop_min().unwrap();
+                    *self = Self::Node {
+                        data: successor,
+                        min_vruntime: 0, // Fixed by `update_and_rebalance`.
+                        height: 0,
+                        left,
+                        right,
+                    };
+                    self.update_and_rebalance();
+                    return Some(task_data);
+                }
+
+                if right.has_eligible_task(
+                    global_min_vruntime,
+                    total_weight,
+                    weighted_vruntime_offsets,
+                ) {
+                    let res = right.pop_next(
+                        global_min_vruntime,
+                        total_weight,
+                        weighted_vruntime_offsets,
+                    );
+                    if res.is_some() {
+                        self.update_and_rebalance();
+                    }
+                    return res;
+                }
+
+                let res = self.pop_min();
+                if res.is_some() {
+                    self.update_and_rebalance();
+                }
+                res
             }
-            UpdateFlags::Exit => !self.is_empty(),
+        }
+    }
+
+    fn has_eligible_task(
+        &self,
+        global_min_vruntime: i64,
+        total_weight: i64,
+        weighted_vruntime_offsets: i64,
+    ) -> bool {
+        match self {
+            Self::Leaf => false,
+            Self::Node {
+                min_vruntime: tree_min_vruntime,
+                ..
+            } => is_eligible(
+                *tree_min_vruntime,
+                global_min_vruntime,
+                total_weight,
+                weighted_vruntime_offsets,
+            ),
+        }
+    }
+
+    fn pop_min(&mut self) -> Option<TaskData> {
+        match self {
+            Self::Leaf => None,
+            Self::Node { left, .. } => {
+                if left.is_leaf() {
+                    let old_self = mem::replace(self, Self::Leaf);
+                    if let Self::Node { data, right, .. } = old_self {
+                        *self = *right;
+                        return Some(data);
+                    }
+                    None
+                } else {
+                    let result = left.pop_min();
+                    self.update_and_rebalance();
+                    result
+                }
+            }
+        }
+    }
+
+    fn is_leaf(&self) -> bool {
+        matches!(self, Self::Leaf)
+    }
+
+    fn update(&mut self) {
+        self.update_height();
+        self.update_min_vruntime();
+    }
+
+    fn height(&self) -> i8 {
+        match self {
+            Self::Leaf => -1,
+            Self::Node { height, .. } => *height,
+        }
+    }
+
+    fn update_height(&mut self) {
+        if let Self::Node {
+            height,
+            left,
+            right,
+            ..
+        } = self
+        {
+            *height = 1 + left.height().max(right.height());
+        }
+    }
+
+    fn update_min_vruntime(&mut self) {
+        if let Self::Node {
+            data,
+            min_vruntime,
+            left,
+            right,
+            ..
+        } = self
+        {
+            *min_vruntime = right.min_vruntime_against(left.min_vruntime_against(data.vruntime));
+        }
+    }
+
+    fn min_vruntime_against(&self, vruntime: i64) -> i64 {
+        match self {
+            Self::Leaf => vruntime,
+            Self::Node { min_vruntime, .. } => vruntime.min(*min_vruntime),
+        }
+    }
+
+    fn balance_factor(&self) -> i8 {
+        match self {
+            Self::Leaf => 0,
+            Self::Node { left, right, .. } => left.height() - right.height(),
+        }
+    }
+
+    fn rotate_left(&mut self) {
+        if let Self::Node { right, .. } = self {
+            let right_node = mem::replace(right, Box::new(Self::Leaf));
+            if let Self::Node {
+                data: rdata,
+                min_vruntime: rmin_vruntime,
+                height: rheight,
+                left: rleft,
+                right: rright,
+            } = *right_node
+            {
+                let old = mem::replace(self, Self::Leaf);
+                if let Self::Node {
+                    data,
+                    min_vruntime,
+                    height,
+                    left,
+                    right: _,
+                } = old
+                {
+                    *self = Self::Node {
+                        data: rdata,
+                        min_vruntime: rmin_vruntime,
+                        height: rheight,
+                        left: Box::new(Self::Node {
+                            data,
+                            min_vruntime,
+                            height,
+                            left,
+                            right: rleft,
+                        }),
+                        right: rright,
+                    };
+                }
+            }
+        }
+        if let Self::Node { left, right, .. } = self {
+            left.update();
+            right.update();
+        }
+        self.update();
+    }
+
+    fn rotate_right(&mut self) {
+        if let Self::Node { left, .. } = self {
+            let left_node = mem::replace(left, Box::new(Self::Leaf));
+            if let Self::Node {
+                data: ldata,
+                min_vruntime: lmin_vruntime,
+                height: lheight,
+                left: lleft,
+                right: lright,
+            } = *left_node
+            {
+                let old = mem::replace(self, Self::Leaf);
+                if let Self::Node {
+                    data,
+                    min_vruntime,
+                    height,
+                    left: _,
+                    right,
+                } = old
+                {
+                    *self = Self::Node {
+                        data: ldata,
+                        min_vruntime: lmin_vruntime,
+                        height: lheight,
+                        left: lleft,
+                        right: Box::new(Self::Node {
+                            data,
+                            min_vruntime,
+                            height,
+                            left: lright,
+                            right,
+                        }),
+                    };
+                }
+            }
+        }
+        if let Self::Node { left, right, .. } = self {
+            left.update();
+            right.update();
+        }
+        self.update();
+    }
+
+    fn update_and_rebalance(&mut self) {
+        self.update();
+
+        let bf = self.balance_factor();
+        if bf > 1 {
+            let Self::Node { left, .. } = self else {
+                return;
+            };
+            if left.balance_factor() < 0 {
+                left.rotate_left();
+            }
+            self.rotate_right();
+        } else if bf < -1 {
+            let Self::Node { right, .. } = self else {
+                return;
+            };
+            if right.balance_factor() > 0 {
+                right.rotate_right();
+            }
+            self.rotate_left();
         }
     }
 }
