@@ -284,7 +284,7 @@ impl ClassScheduler {
         let guard = disable_local();
         let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
         let mut selected = guard.current_cpu();
-        let mut minimum_load = u32::MAX;
+        let mut minimum_load = usize::MAX;
         let last_chosen = match self.last_chosen_cpu.get() {
             Some(cpu) => cpu.as_usize() as isize,
             None => -1,
@@ -304,11 +304,16 @@ impl ClassScheduler {
             );
         for candidate in affinity_iter {
             let PerCpuLoadStats {
-                queued_non_idle,
-                running_non_idle,
+                queue_len,
+                is_idle_running,
             } = self.rqs[candidate.as_usize()].lock().load_stats();
-            let running = u32::from(running_non_idle.is_some());
-            let load = queued_non_idle + running;
+            // A penalty to a CPU running the idle task.
+            //
+            // We increase the load by one when a candidate CPU is running the idle task.
+            // This is shown to be a good heuristics by experiments (https://github.com/asterinas/asterinas/pull/2426).
+            // Of course. This heuristics is trivial and should be replaced with a more advanced one in the future.
+            let idle_running_penalty = usize::from(is_idle_running);
+            let load = queue_len + idle_running_penalty;
             if load < minimum_load {
                 minimum_load = load;
                 selected = candidate;
@@ -341,14 +346,14 @@ impl PerCpuClassRqSet {
     }
 
     fn load_stats(&self) -> PerCpuLoadStats {
-        let queued_non_idle = (self.stop.len() + self.real_time.len() + self.fair.len()) as u32;
-        let running_non_idle = self
-            .current
-            .as_ref()
-            .map(|((_, thread), _)| thread.sched_attr().policy_kind() != SchedPolicyKind::Idle);
+        let queue_len = self.stop.len() + self.real_time.len() + self.fair.len();
+        let is_idle_running = match &self.current {
+            None => false,
+            Some(((_, thread), _)) => thread.sched_attr().policy_kind() == SchedPolicyKind::Idle,
+        };
         PerCpuLoadStats {
-            queued_non_idle,
-            running_non_idle,
+            queue_len,
+            is_idle_running,
         }
     }
 }
@@ -405,11 +410,10 @@ impl LocalRunQueue for PerCpuClassRqSet {
 
 /// Holds per-CPU load information.
 struct PerCpuLoadStats {
-    /// The number of queued threads, excluding the idle one.
-    queued_non_idle: u32,
+    /// The length of the run queue (excluding the idle task).
+    queue_len: usize,
     /// Whether the running thread is not the idle one.
-    /// [`None`] means that there's no thread currently running.
-    running_non_idle: Option<bool>,
+    is_idle_running: bool,
 }
 
 impl SchedulerStats for ClassScheduler {
@@ -418,11 +422,11 @@ impl SchedulerStats for ClassScheduler {
             .iter()
             .fold((0, 0), |(mut queued, mut running), rq| {
                 let PerCpuLoadStats {
-                    queued_non_idle,
-                    running_non_idle,
+                    queue_len,
+                    is_idle_running,
                 } = rq.lock().load_stats();
-                queued += queued_non_idle;
-                running += u32::from(running_non_idle == Some(true));
+                queued += queue_len as u32;
+                running += u32::from(!is_idle_running);
                 (queued, running)
             })
     }
